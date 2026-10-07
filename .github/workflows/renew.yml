@@ -157,7 +157,9 @@ jobs:
           PIDGINHOST_API_TOKEN: ${{ secrets.PIDGINHOST_API_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PANEL_COOKIE: ${{ secrets.PANEL_COOKIE }}   # ✅ 关键修复：传递 Cookie
+          # 站点已取消长效 cookie，改走账号密码登录
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
         run: python3 script.py
 
       # 已移除"最终通知"步骤，只保留脚本内部的续期结果通知

@@ -13,14 +13,15 @@ PANEL_BASE = 'https://www.pidginhost.com/'
 PROXY = os.getenv('PROXY_SERVER')
 TG_TOKEN = os.getenv('TG_BOT_TOKEN')
 TG_CHAT = os.getenv('TG_CHAT_ID')
-PANEL_COOKIE_RAW = os.getenv('PANEL_COOKIE')
+EMAIL = (os.getenv('EMAIL') or '').strip()
+PASSWORD = (os.getenv('PASSWORD') or '').strip()
 
 if not API_TOKEN:
     print('❌ 缺少 PIDGINHOST_API_TOKEN')
     sys.exit(1)
 
-if not PANEL_COOKIE_RAW:
-    print('❌ 缺少 PANEL_COOKIE')
+if not EMAIL or not PASSWORD:
+    print('❌ 缺少 EMAIL / PASSWORD')
     sys.exit(1)
 
 proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
@@ -34,31 +35,75 @@ panel_session = requests.Session()
 if proxies:
     panel_session.proxies.update(proxies)
 
-panel_session.cookies.clear()
+# ---------- 脱敏（仓库 public，Actions 日志公开可见）----------
+def mask_email(v):
+    if not v or '@' not in v:
+        return '***'
+    u, d = v.split('@', 1)
+    return (u[:2] + '***@' + d) if len(u) > 2 else '***@' + d
 
-# 解析 Cookie
-cookie_dict = {}
-raw = PANEL_COOKIE_RAW.strip()
-if raw.startswith('[') or raw.startswith('{'):
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            for item in data:
-                if 'name' in item and 'value' in item:
-                    cookie_dict[item['name']] = item['value']
-        elif isinstance(data, dict):
-            cookie_dict = data
-    except json.JSONDecodeError:
-        pass
+def mask_ip(v):
+    parts = str(v).split('.')
+    return f'{parts[0]}.{parts[1]}.x.x' if len(parts) == 4 else 'x.x.x.x'
 
-if not cookie_dict:
-    for pair in raw.split(';'):
-        pair = pair.strip()
-        if '=' in pair:
-            k, v = pair.split('=', 1)
-            cookie_dict[k] = v
+def mask_url(u):
+    u = re.sub(r'([?&](?:token|code|key|session|next)=)[^&\s]+', r'\1***', str(u))
+    return re.sub(r'/panel/[\w-]{16,}/', '/panel/***/', u)
 
-panel_session.cookies.update(cookie_dict)
+# ---------- 登录（站点已取消长效 cookie，改走账号密码）----------
+LOGIN_URL = urljoin(PANEL_BASE, 'panel/account/login')
+LOCAL_LOGIN_URL = urljoin(PANEL_BASE, 'panel/account/login/local')
+
+def _csrf(html):
+    m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', html)
+    return m.group(1) if m else None
+
+def login_panel(session):
+    """两步登录：先交 email 换出密码页，再提交密码。
+    每次运行都重新登录 —— 不依赖任何会过期的 cookie。"""
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            session.cookies.clear()
+            r = session.get(LOGIN_URL, timeout=30)
+            if r.status_code != 200:
+                last_err = f'登录页返回 {r.status_code}'
+                time.sleep(3); continue
+
+            tok = _csrf(r.text)
+            if not tok:
+                last_err = '登录页未找到 csrfmiddlewaretoken'
+                time.sleep(3); continue
+
+            # 第 1 步：提交邮箱
+            r1 = session.post(
+                LOGIN_URL,
+                data={'csrfmiddlewaretoken': tok, 'email': EMAIL},
+                headers={'Referer': LOGIN_URL}, allow_redirects=True, timeout=30)
+
+            tok2 = _csrf(r1.text) or tok
+            # 第 2 步：提交密码（hidden username 由页面带入，这里显式带上）
+            r2 = session.post(
+                LOCAL_LOGIN_URL,
+                data={'csrfmiddlewaretoken': tok2, 'username': EMAIL,
+                      'password': PASSWORD, 'remember_me': 'on'},
+                headers={'Referer': r1.url}, allow_redirects=True, timeout=30)
+
+            # 第 3 步：验证 —— 访问需要登录的页面
+            probe = session.get(urljoin(PANEL_BASE, 'panel/cloud/servers/'),
+                                allow_redirects=True, timeout=30)
+            if '/account/login' in probe.url or probe.status_code != 200:
+                last_err = f'登录后仍被重定向到登录页（{mask_url(probe.url)}，{probe.status_code}）'
+                time.sleep(2); continue
+
+            print(f'✅ 账号密码登录成功（{mask_email(EMAIL)}），已进入 panel')
+            return True
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(2)
+
+    print(f'❌ 登录失败：{last_err}')
+    return False
 
 # ---------- 工具函数 ----------
 def send_tg(text):
@@ -142,6 +187,8 @@ def get_current_days_for_url(url, session, max_retries=3, delay=2):
         if days is not None:
             return days, resp, final_url
         snippet = resp.text[:300].replace('\n', ' ')
+        snippet = re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', snippet)   # public 仓库，别泄露邮箱
+        snippet = re.sub(r'\b(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}\b', r'\1.x.x', snippet)
         print(f'  ⚠️ 未解析到天数 (尝试 {attempt+1}/{max_retries})，页面开头片段：{snippet}')
     return None, None, None
 
@@ -178,7 +225,7 @@ def renew_server_via_panel(server_id):
             return False, "续期请求重定向到登录页，Cookie 已失效", None
         if not location.startswith('http'):
             location = urljoin(PANEL_BASE, location)
-        print(f'  ✅ 收到续期重定向，Location: {location}')
+        print(f'  ✅ 收到续期重定向，Location: {mask_url(location)}')
         final_url = location
     else:
         return False, f"续期请求失败 (状态码 {post_resp.status_code})", None
@@ -217,19 +264,11 @@ def fetch_all_servers():
 # ---------- 主逻辑 ----------
 def main():
     try:
-        # 更严格的 Cookie 验证：尝试访问服务器列表页（需要登录）
-        test_url = urljoin(PANEL_BASE, 'panel/cloud/servers/')
-        test_resp = panel_session.get(test_url, timeout=30)
-        if test_resp.status_code != 200:
-            print('❌ Cookie 无效或已过期，请重新导出并更新 PANEL_COOKIE')
-            send_tg('❌ PidginHost 续期失败：Cookie 无效或过期')
+        # 每次运行重新登录（站点已取消长效 cookie）
+        print('🔑 正在登录 panel...')
+        if not login_panel(panel_session):
+            send_tg('❌ PidginHost 续期失败：账号密码登录失败')
             sys.exit(1)
-        # 检查是否被重定向到登录页
-        if test_resp.url and '/login' in test_resp.url:
-            print('❌ Cookie 已过期（重定向到登录页）')
-            send_tg('❌ PidginHost 续期失败：Cookie 已过期')
-            sys.exit(1)
-        print('✅ Panel Cookie 有效')
 
         # 获取服务器列表
         print('📄 获取所有云服务器...')
