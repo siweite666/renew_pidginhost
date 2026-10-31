@@ -324,22 +324,17 @@ def fetch_all_servers_via_panel():
         print(f'  🔍 诊断: 页面是否含 "expires": {"expires" in html.lower()}')
         print(f'  🔍 诊断: 页面开头: '
               + re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', html[:400].replace("\n", " ")))
-        # profile_incomplete 时把表单字段列出来（只看 name/type/required，不取值）
+        # profile_incomplete：打印 profile 页可见文字，找出缺什么
         try:
             prof = panel_session.get(urljoin(PANEL_BASE, 'panel/account/profile/'), timeout=30)
-            print(f'  🔍 profile 页: {prof.status_code}, {len(prof.text)} 字符, url={mask_url(prof.url)}')
-            fields = re.findall(r'<(input|select|textarea)\s+([^>]*)>', prof.text, re.I)
-            seen = []
-            for tag, attrs in fields:
-                nm = re.search(r'name="([^"]+)"', attrs)
-                ty = re.search(r'type="([^"]+)"', attrs)
-                rq = 'required' in attrs.lower()
-                if nm:
-                    seen.append(f'{nm.group(1)}[{ty.group(1) if ty else tag}{",req" if rq else ""}]')
-            print(f'  🔍 profile 表单字段: {seen}')
-            # 页面里的提示文字
-            hints = re.findall(r'(?:alert|text-danger|form-text)[^>]*>([^<]{10,140})', prof.text)
-            print(f'  🔍 profile 提示: {[h.strip()[:100] for h in hints[:8]]}')
+            t = re.sub(r'<script.*?</script>', ' ', prof.text, flags=re.S | re.I)
+            t = re.sub(r'<style.*?</style>', ' ', t, flags=re.S | re.I)
+            t = re.sub(r'<[^>]+>', '\n', t)
+            t = re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', t)
+            lines = [x.strip() for x in t.splitlines() if x.strip()]
+            print(f'  🔍 profile 可见文字 ({len(lines)} 行):')
+            for l in lines[:60]:
+                print(f'      | {l[:120]}')
         except Exception as e:
             print(f'  🔍 profile 探测失败: {e}')
         raise RuntimeError('页面里没找到任何服务器 ID（panel 结构可能变了）')
