@@ -92,6 +92,14 @@ def login_panel(session):
             # 第 3 步：验证 —— 访问需要登录的页面
             probe = session.get(urljoin(PANEL_BASE, 'panel/cloud/servers/'),
                                 allow_redirects=True, timeout=30)
+            # ★ profile 未填完时站点把任何业务页重定向到
+            #   /panel/account/profile/?next=...（状态码 200，不会命中登录检查），
+            #   API 同时返回 403 {"code":"profile_incomplete"}。必须单独识别。
+            if '/account/profile' in probe.url:
+                print('❌ panel 资料未填完（first_name / last_name / phone）')
+                print('   站点要求：https://www.pidginhost.com/panel/account/profile/')
+                print('   补齐前 API 一律 403 profile_incomplete，续期无法进行')
+                return False
             if '/account/login' in probe.url or probe.status_code != 200:
                 last_err = f'登录后仍被重定向到登录页（{mask_url(probe.url)}，{probe.status_code}）'
                 time.sleep(2); continue
@@ -277,69 +285,40 @@ def fetch_all_servers_via_panel():
             print(f'  ✅ 经 panel cookie 取到 {len(items)} 台服务器（API）')
             return items
     except Exception as e:
-        print(f'  ⚠️ panel cookie 调 API 失败（{e}），改用页面解析')
+        body = ''
         try:
-            _r = panel_session.get(url, timeout=30, headers={'Accept': 'application/json'})
-            print(f'  🔍 诊断: API {_r.status_code}, body={_r.text[:200]}')
+            body = getattr(getattr(e, 'response', None), 'text', '') or ''
         except Exception:
             pass
+        if 'profile_incomplete' in body:
+            raise RuntimeError(
+                'panel 资料未填完（profile_incomplete）：请先在 '
+                'https://www.pidginhost.com/panel/account/profile/ '
+                '填写 first_name / last_name / phone，否则 API 一律 403') from None
+        print(f'  ⚠️ panel cookie 调 API 失败（{e}），改用页面解析')
 
-    # 兜底：从 panel 页面 HTML 里抓服务器 ID
+    # 兜底：从 panel 页面 HTML 里抓 /panel/cloud/servers/{id}/
     page_url = urljoin(PANEL_BASE, 'panel/cloud/servers/')
     resp = panel_session.get(page_url, timeout=30,
                              headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
-    print(f'  🔍 诊断: 页面 {resp.status_code}, {len(resp.text)} 字符, url={mask_url(resp.url)}')
     if '/account/login' in resp.url:
         raise RuntimeError('panel 会话失效，重定向到登录页')
+    if '/account/profile' in resp.url:
+        raise RuntimeError(
+            'panel 资料未填完（被重定向到 profile 页）：请先在 '
+            'https://www.pidginhost.com/panel/account/profile/ '
+            '填写 first_name / last_name / phone')
     resp.raise_for_status()
 
-    html = resp.text
-    # 多种可能的 ID 呈现方式
     ids = []
-
-    # a) 链接样式 /panel/cloud/servers/{id}/ 或 /panel/cloud/servers/{id}
-    for m in re.finditer(r'/panel/cloud/servers/([0-9A-Za-z_-]+)', html):
-        v = m.group(1)
-        if v not in ('new', 'create') and v not in ids:
-            ids.append(v)
-
-    # b) data-* 属性
+    for m in re.finditer(r'/panel/cloud/servers/(\d+)/', resp.text):
+        sid = int(m.group(1))
+        if sid not in ids:
+            ids.append(sid)
     if not ids:
-        for m in re.finditer(r'data-(?:server|vps|id)[\w-]*="(\d+)"', html, re.I):
-            if m.group(1) not in ids:
-                ids.append(m.group(1))
-
-    # c) 内嵌 JSON 里的 "id": 123
-    if not ids:
-        for m in re.finditer(r'"id"\s*:\s*(\d{2,7})', html):
-            if m.group(1) not in ids:
-                ids.append(m.group(1))
-
-    if not ids:
-        # 最后一招：把结构打出来（脱敏），供人工判断
-        hrefs = sorted({re.sub(r'\?.*$', '', h) for h in
-                        re.findall(r'href="([^"]+)"', html)
-                        if 'server' in h.lower() or 'cloud' in h.lower()})
-        print(f'  🔍 诊断: 含 server/cloud 的 href ({len(hrefs)} 个): {hrefs[:15]}')
-        print(f'  🔍 诊断: 页面是否含 "expires": {"expires" in html.lower()}')
-        print(f'  🔍 诊断: 页面开头: '
-              + re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', html[:400].replace("\n", " ")))
-        # profile_incomplete：打印 profile 页可见文字，找出缺什么
-        try:
-            prof = panel_session.get(urljoin(PANEL_BASE, 'panel/account/profile/'), timeout=30)
-            t = re.sub(r'<script.*?</script>', ' ', prof.text, flags=re.S | re.I)
-            t = re.sub(r'<style.*?</style>', ' ', t, flags=re.S | re.I)
-            t = re.sub(r'<[^>]+>', '\n', t)
-            t = re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', t)
-            lines = [x.strip() for x in t.splitlines() if x.strip()]
-            print(f'  🔍 profile 可见文字 ({len(lines)} 行):')
-            for l in lines[:60]:
-                print(f'      | {l[:120]}')
-        except Exception as e:
-            print(f'  🔍 profile 探测失败: {e}')
         raise RuntimeError('页面里没找到任何服务器 ID（panel 结构可能变了）')
 
-    print(f'  ✅ 经页面解析取到 {len(ids)} 台服务器: {ids}')
+    print(f'  ✅ 经页面解析取到 {len(ids)} 台服务器')
     return [{'id': sid, 'name': '未命名'} for sid in ids]
 
 # ---------- 主逻辑 ----------
