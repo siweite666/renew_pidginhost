@@ -278,24 +278,55 @@ def fetch_all_servers_via_panel():
             return items
     except Exception as e:
         print(f'  ⚠️ panel cookie 调 API 失败（{e}），改用页面解析')
+        try:
+            _r = panel_session.get(url, timeout=30, headers={'Accept': 'application/json'})
+            print(f'  🔍 诊断: API {_r.status_code}, body={_r.text[:200]}')
+        except Exception:
+            pass
 
-    # 兜底：从 panel 页面 HTML 里抓 /panel/cloud/servers/{id}/
+    # 兜底：从 panel 页面 HTML 里抓服务器 ID
     page_url = urljoin(PANEL_BASE, 'panel/cloud/servers/')
     resp = panel_session.get(page_url, timeout=30,
                              headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+    print(f'  🔍 诊断: 页面 {resp.status_code}, {len(resp.text)} 字符, url={mask_url(resp.url)}')
     if '/account/login' in resp.url:
         raise RuntimeError('panel 会话失效，重定向到登录页')
     resp.raise_for_status()
 
+    html = resp.text
+    # 多种可能的 ID 呈现方式
     ids = []
-    for m in re.finditer(r'/panel/cloud/servers/(\d+)/', resp.text):
-        sid = int(m.group(1))
-        if sid not in ids:
-            ids.append(sid)
+
+    # a) 链接样式 /panel/cloud/servers/{id}/ 或 /panel/cloud/servers/{id}
+    for m in re.finditer(r'/panel/cloud/servers/([0-9A-Za-z_-]+)', html):
+        v = m.group(1)
+        if v not in ('new', 'create') and v not in ids:
+            ids.append(v)
+
+    # b) data-* 属性
     if not ids:
+        for m in re.finditer(r'data-(?:server|vps|id)[\w-]*="(\d+)"', html, re.I):
+            if m.group(1) not in ids:
+                ids.append(m.group(1))
+
+    # c) 内嵌 JSON 里的 "id": 123
+    if not ids:
+        for m in re.finditer(r'"id"\s*:\s*(\d{2,7})', html):
+            if m.group(1) not in ids:
+                ids.append(m.group(1))
+
+    if not ids:
+        # 最后一招：把结构打出来（脱敏），供人工判断
+        hrefs = sorted({re.sub(r'\?.*$', '', h) for h in
+                        re.findall(r'href="([^"]+)"', html)
+                        if 'server' in h.lower() or 'cloud' in h.lower()})
+        print(f'  🔍 诊断: 含 server/cloud 的 href ({len(hrefs)} 个): {hrefs[:15]}')
+        print(f'  🔍 诊断: 页面是否含 "expires": {"expires" in html.lower()}')
+        print(f'  🔍 诊断: 页面开头: '
+              + re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***@***', html[:400].replace("\n", " ")))
         raise RuntimeError('页面里没找到任何服务器 ID（panel 结构可能变了）')
 
-    print(f'  ✅ 经页面解析取到 {len(ids)} 台服务器')
+    print(f'  ✅ 经页面解析取到 {len(ids)} 台服务器: {ids}')
     return [{'id': sid, 'name': '未命名'} for sid in ids]
 
 # ---------- 主逻辑 ----------
