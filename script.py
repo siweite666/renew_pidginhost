@@ -17,8 +17,8 @@ EMAIL = (os.getenv('EMAIL') or '').strip()
 PASSWORD = (os.getenv('PASSWORD') or '').strip()
 
 if not API_TOKEN:
-    print('❌ 缺少 PIDGINHOST_API_TOKEN')
-    sys.exit(1)
+    # token 已不具备 cloud/servers 读权限（403），列表走 panel cookie
+    print('ℹ️ 未提供 PIDGINHOST_API_TOKEN，服务器列表将走 panel 会话')
 
 if not EMAIL or not PASSWORD:
     print('❌ 缺少 EMAIL / PASSWORD')
@@ -250,16 +250,53 @@ def renew_server_via_panel(server_id):
     else:
         return False, f"续期异常（旧：{old_days}，新：{new_days}）", new_days
 
-def fetch_all_servers():
+def fetch_all_servers_via_panel():
+    """从 panel 的已登录会话取服务器列表。
+
+    schema（/api/schema/）明确列出 /api/cloud/servers/ 同时接受
+    tokenAuth 和 cookieAuth，所以这里复用 panel_session 的 cookie，
+    不再依赖 PIDGINHOST_API_TOKEN —— 那个 token 在 2026-10-31 的
+    run 里返回 403（认证通过但无权限，不是 401 Invalid token）。
+    """
+    # 首选：同一个 API，改用 cookie 认证
     url = urljoin('https://www.pidginhost.com/api/', 'cloud/servers/')
     items = []
-    while url:
-        resp = api_session.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        items.extend(data.get('results', []))
-        url = data.get('next')
-    return items
+    try:
+        while url:
+            resp = panel_session.get(
+                url, timeout=30,
+                headers={'Accept': 'application/json',
+                         'Cache-Control': 'no-cache, no-store, must-revalidate'})
+            if resp.status_code in (301, 302) or '/account/login' in resp.url:
+                raise RuntimeError('panel 会话失效，重定向到登录页')
+            resp.raise_for_status()
+            data = resp.json()
+            items.extend(data.get('results', []))
+            url = data.get('next')
+        if items:
+            print(f'  ✅ 经 panel cookie 取到 {len(items)} 台服务器（API）')
+            return items
+    except Exception as e:
+        print(f'  ⚠️ panel cookie 调 API 失败（{e}），改用页面解析')
+
+    # 兜底：从 panel 页面 HTML 里抓 /panel/cloud/servers/{id}/
+    page_url = urljoin(PANEL_BASE, 'panel/cloud/servers/')
+    resp = panel_session.get(page_url, timeout=30,
+                             headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
+    if '/account/login' in resp.url:
+        raise RuntimeError('panel 会话失效，重定向到登录页')
+    resp.raise_for_status()
+
+    ids = []
+    for m in re.finditer(r'/panel/cloud/servers/(\d+)/', resp.text):
+        sid = int(m.group(1))
+        if sid not in ids:
+            ids.append(sid)
+    if not ids:
+        raise RuntimeError('页面里没找到任何服务器 ID（panel 结构可能变了）')
+
+    print(f'  ✅ 经页面解析取到 {len(ids)} 台服务器')
+    return [{'id': sid, 'name': '未命名'} for sid in ids]
 
 # ---------- 主逻辑 ----------
 def main():
@@ -272,7 +309,7 @@ def main():
 
         # 获取服务器列表
         print('📄 获取所有云服务器...')
-        servers = fetch_all_servers()
+        servers = fetch_all_servers_via_panel()
         print(f'📋 找到 {len(servers)} 台服务器')
 
         renewed = 0
